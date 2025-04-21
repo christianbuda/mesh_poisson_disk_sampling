@@ -456,8 +456,8 @@ def distance_graph(vertices, faces):
     # create the corresponding graph to compute shortest line path
     G = nx.Graph()
     for edge in edges:
-        length = np.linalg.norm(vertices[edge[0]] - vertices[edge[1]])
-        G.add_edge(*edge, length = length)
+        weight = np.linalg.norm(vertices[edge[0]] - vertices[edge[1]])
+        G.add_edge(*edge, weight = weight)
     
     return G
 
@@ -466,11 +466,11 @@ def edge_distances(G, sources, targets):
     # computes edge distances between sources and targets
     dists = np.zeros((len(sources), len(targets)))
     
-    all_dists = dict(nx.all_pairs_bellman_ford_path_length(G, weight='length'))
+    all_dists = dict(nx.all_pairs_bellman_ford_path_length(G))
     
-    for i in sources:
-        for j in targets:
-            dists[i,j] = all_dists[i][j]
+    for i in range(len(sources)):
+        for j in range(len(targets)):
+            dists[i,j] = all_dists[int(sources[i])][int(targets[j])]
     return dists
 
 def compute_graph_dist_matrix(G, vertices):
@@ -479,7 +479,7 @@ def compute_graph_dist_matrix(G, vertices):
     nverts = len(vertices)
     out = np.zeros((nverts, nverts))
     
-    all_dists = dict(nx.all_pairs_bellman_ford_path_length(G, weight='length'))
+    all_dists = dict(nx.all_pairs_bellman_ford_path_length(G))
     
     # fill upper triangular part of matrix
     for idx in range(nverts-1):
@@ -564,7 +564,7 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist, num_points = 
         # check if points are at the correct distance from current center
         geoalg = distance_graph(full_circle_vertices, full_circle_faces)
         good_points = full_circle_vertices.shape[0] - np.arange(points_to_sample, 0, -1)
-        dists = edge_distances(distance_graph, [source], good_points)[0]
+        dists = edge_distances(geoalg, [source], good_points)[0]
         good_points = good_points[(dists>min_dist)&(dists<2*min_dist)]
         
         if len(good_points>0):
@@ -605,7 +605,7 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist, num_points = 
         geoalg = distance_graph(submesh_vertices, submesh_faces)
         tokeep = []
         for i,p in enumerate(new_points_to_check):
-            dists = edge_distances([p], old_points_to_check)[0]
+            dists = edge_distances(geoalg, [p], old_points_to_check)[0]
             if dists.min()>min_dist:
                 tokeep.append(good_points[i])
                 Q.append(good_points[i])
