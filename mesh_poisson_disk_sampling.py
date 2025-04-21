@@ -287,8 +287,16 @@ def compute_dist_matrix(geoalg, vertices):
     
     return out
 
-def poisson_disk_sampling(vertices, faces, min_dist, num_dip = None, seed_vertices = None, remesh = True, generator = None):
-    # min_dist: minimum distance in mm, if None it is estimated from num_dip
+def poisson_disk_sampling(vertices, faces, min_dist, num_points = None, seed_vertices = None, remesh = False, generator = None):
+    """
+        vertices: array (n_vertices, 3), vertices array of the mesh
+        faces: array (n_faces, 3), faces array of the mesh
+        min_dist: float, minimum distance between the points of the poisson sampling
+        num_points: (optional) int, rough number of points to sample, if min_dist is None, this should be given
+        seed_vertices: (optional) list of int, index of the vertices that should be included in the final sampling
+        remesh: boolean, whether or not to apply a flat remeshing strategy. This will increase the quality of the sampling, but lower the speed of the algorithm
+        generator: (optional) a numpy random generator object to control random sampling
+    """
     
     
     if generator is None:
@@ -301,10 +309,10 @@ def poisson_disk_sampling(vertices, faces, min_dist, num_dip = None, seed_vertic
     # get a rough estimate of the number of points needed to cover the mesh
     total_area = triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).sum()
     if min_dist is not None:
-        num_dip = int(0.5*total_area/min_dist**2)  # rough estimate, the 0.5 is empirical
+        num_points = int(0.5*total_area/min_dist**2)  # rough estimate, the 0.5 is empirical
     elif min_dist is None:
-        assert num_dip is not None, 'If min_dist is None, num_dip must be not None'
-        min_dist = np.sqrt(0.5*total_area/num_dip)
+        assert num_points is not None, 'If min_dist is None, num_points must be not None'
+        min_dist = np.sqrt(0.5*total_area/num_points)
         
         
     Q = deque()
@@ -324,10 +332,10 @@ def poisson_disk_sampling(vertices, faces, min_dist, num_dip = None, seed_vertic
 
 
     iter = 0
-    pbar = tqdm(total=num_dip, desc="Poisson disk sampling points")
+    pbar = tqdm(total=num_points, desc="Poisson disk sampling points")
     while len(Q) > 0:
         pbar.set_description("Iteration %d" % (iter+1))
-        # print(f'Iter: {iter}, dipole: {len(sampled_dipoles)}/{num_dip}')
+        # print(f'Iter: {iter}, dipole: {len(sampled_dipoles)}/{num_points}')
         
         # current point
         point = Q.popleft()
