@@ -464,7 +464,7 @@ def distance_graph(vertices, faces):
 
 def edge_distances(G, sources, targets):
     # computes edge distances between sources and targets
-    dists = np.zeros((len(sources, len(targets))))
+    dists = np.zeros((len(sources), len(targets)))
     
     all_dists = dict(nx.all_pairs_bellman_ford_path_length(G, weight='length'))
     
