@@ -326,7 +326,7 @@ def poisson_disk_sampling(vertices, faces, min_dist, num_points = None, seed_ver
 
         Q.append(vertices.shape[0]-1)
     else:
-        if not isinstance(seed_vertices, np.array):
+        if not isinstance(seed_vertices, np.ndarray):
             assert isinstance(seed_vertices, list), 'Seed vertices must be a list of mesh vertices'
         else:
             assert len(seed_vertices.shape) == 1 and seed_vertices.dtype == int, 'Seed vertices must be a list of mesh vertices'
