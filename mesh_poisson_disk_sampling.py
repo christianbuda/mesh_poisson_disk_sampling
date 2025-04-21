@@ -360,14 +360,15 @@ def poisson_disk_sampling(vertices, faces, min_dist, num_points = None, seed_ver
         good_points = full_circle_vertices.shape[0] - np.arange(points_to_sample, 0, -1)
         dists = geoalg.geodesicDistances([source], good_points)[0]
         good_points = good_points[(dists>min_dist)&(dists<2*min_dist)]
-        
-        # check which points are at the correct distance from each other
-        dist_matrix = compute_dist_matrix(geoalg, good_points)
-        tokeep = [0]
-        for i in range(1,len(good_points)):
-            if dist_matrix[tokeep, i].min()>min_dist:
-                tokeep.append(i)
-        good_points = good_points[tokeep]-full_circle_vertices.shape[0]+points_to_sample
+
+        if len(good_points)>0:
+            # check which points are at the correct distance from each other
+            dist_matrix = compute_dist_matrix(geoalg, good_points)
+            tokeep = [0]
+            for i in range(1,len(good_points)):
+                if dist_matrix[tokeep, i].min()>min_dist:
+                    tokeep.append(i)
+            good_points = good_points[tokeep]-full_circle_vertices.shape[0]+points_to_sample
         
         # add the good points so far to the main mesh
         sampled_points = points_from_coeffs(vertices, faces, sampled_faces[good_points], sampled_coeff[good_points])
