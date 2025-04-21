@@ -295,6 +295,7 @@ def poisson_disk_sampling(vertices, faces, min_dist, num_points = None, seed_ver
         num_points: (optional) int, rough number of points to sample, if min_dist is None, this should be given
         seed_vertices: (optional) list of int, index of the vertices that should be included in the final sampling
         remesh: boolean, whether or not to apply a flat remeshing strategy. This will increase the quality of the sampling, but lower the speed of the algorithm
+                NOTE: sometimes it does not work, try upsampling with something more robust
         generator: (optional) a numpy random generator object to control random sampling
     """
     
