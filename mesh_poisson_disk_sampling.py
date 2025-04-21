@@ -412,3 +412,29 @@ def poisson_disk_sampling(vertices, faces, min_dist, num_points = None, seed_ver
     
     
     return vertices, faces, sampled_dipoles
+
+
+def uniform_sampling(vertices, faces, num_points, remesh = False, generator = None):
+    """
+    wrapper for sample_mesh_points()
+    
+    this uniform sampling is approximate, as each face is only selected once for the sampling, it's good in the limit where num_points << n_faces
+    
+        vertices: array (n_vertices, 3), vertices array of the mesh
+        faces: array (n_faces, 3), faces array of the mesh
+        num_points: int, number of points to sample
+        remesh: boolean, whether or not to apply a flat remeshing strategy. This will increase the quality of the sampling, but lower the speed of the algorithm
+        generator: (optional) a numpy random generator object to control random sampling
+    """
+    
+    
+    if generator is None:
+        generator = np.random.default_rng()
+        
+    if remesh == True:
+        print('Performing flat remeshing on input mesh...')
+        vertices, faces = flat_remeshing(vertices, faces)
+
+    vertices, faces =  sample_mesh_points(vertices, faces, npoints = num_points, generator = generator)
+    sampled_points = np.arange(len(vertices)-num_points, len(vertices))
+    return vertices, faces, sampled_points
