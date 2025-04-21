@@ -444,3 +444,183 @@ def uniform_sampling(vertices, faces, num_points, remesh = False, generator = No
     vertices, faces =  sample_mesh_points(vertices, faces, npoints = num_points, generator = generator)
     sampled_points = np.arange(len(vertices)-num_points, len(vertices))
     return vertices, faces, sampled_points
+
+
+def distance_graph(vertices, faces):
+    # create a weigthed graph from the mesh to allow edge path length computations
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+
+    # edges without duplication
+    edges = mesh.edges_unique
+
+    # create the corresponding graph to compute shortest line path
+    G = nx.Graph()
+    for edge in edges:
+        length = np.linalg.norm(vertices[edge[0]] - vertices[edge[1]])
+        G.add_edge(*edge, length = length)
+    
+    return G
+
+
+def edge_distances(G, sources, targets):
+    # computes edge distances between sources and targets
+    dists = np.zeros((len(sources, len(targets))))
+    
+    all_dists = dict(nx.all_pairs_bellman_ford_path_length(G, weight='length'))
+    
+    for i in sources:
+        for j in targets:
+            dists[i,j] = all_dists[i][j]
+    return dists
+
+def compute_graph_dist_matrix(G, vertices):
+    # compute distance matrix between list of vertices
+    
+    nverts = len(vertices)
+    out = np.zeros((nverts, nverts))
+    
+    all_dists = dict(nx.all_pairs_bellman_ford_path_length(G, weight='length'))
+    
+    # fill upper triangular part of matrix
+    for idx in range(nverts-1):
+        for j in range(idx+1,nverts):
+            out[idx,j] = all_dists[vertices[idx]][vertices[j]]
+    
+    # simmetrize distance matrix
+    i_lower = np.tril_indices(nverts, -1)
+    out[i_lower] = out.T[i_lower]
+    
+    return out
+
+
+def edge_distance_poisson_disk_sampling(vertices, faces, min_dist, num_points = None, seed_vertices = None, remesh = False, generator = None):
+    """
+        vertices: array (n_vertices, 3), vertices array of the mesh
+        faces: array (n_faces, 3), faces array of the mesh
+        min_dist: float, minimum distance between the points of the poisson sampling
+        num_points: (optional) int, rough number of points to sample, if min_dist is None, this should be given
+        seed_vertices: (optional) list of int, index of the vertices that should be included in the final sampling
+        remesh: boolean, whether or not to apply a flat remeshing strategy. This will increase the quality of the sampling, but lower the speed of the algorithm
+                NOTE: sometimes it does not work, try upsampling with something more robust
+        generator: (optional) a numpy random generator object to control random sampling
+    """
+    
+    
+    if generator is None:
+        generator = np.random.default_rng()
+        
+    if remesh == True:
+        print('Performing flat remeshing on input mesh...')
+        vertices, faces = flat_remeshing(vertices, faces)
+
+    # get a rough estimate of the number of points needed to cover the mesh
+    total_area = triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).sum()
+    if min_dist is not None:
+        num_points = int(0.5*total_area/min_dist**2)  # rough estimate, the 0.5 is empirical
+    elif min_dist is None:
+        assert num_points is not None, 'If min_dist is None, num_points must be not None'
+        min_dist = np.sqrt(0.5*total_area/num_points)
+        
+        
+    Q = deque()
+
+    if seed_vertices is None:
+        # sample first point
+        vertices, faces = sample_mesh_points(vertices, faces, npoints = 1, generator = generator)
+
+        sampled_dipoles = [vertices.shape[0]-1]
+
+        Q.append(vertices.shape[0]-1)
+    else:
+        if not isinstance(seed_vertices, np.ndarray):
+            assert isinstance(seed_vertices, list), 'Seed vertices must be a list of mesh vertices'
+        else:
+            assert len(seed_vertices.shape) == 1 and seed_vertices.dtype == int, 'Seed vertices must be a list of mesh vertices'
+        sampled_dipoles = []
+        for v in seed_vertices:
+            sampled_dipoles.append(v)
+            Q.append(v)
+
+
+    iter = 0
+    pbar = tqdm(total=num_points, desc="Poisson disk sampling points")
+    while len(Q) > 0:
+        pbar.set_description("Iteration %d" % (iter+1))
+        # print(f'Iter: {iter}, dipole: {len(sampled_dipoles)}/{num_points}')
+        
+        # current point
+        point = Q.popleft()
+        
+        # create circular submesh from which to sample
+        full_circle_vertices, full_circle_faces, source, selected_faces, original_faces = get_submesh_faces(vertices, faces, point, min_dist, method = 'any')
+        points_to_sample = len(selected_faces)
+        
+        # sample points
+        (full_circle_vertices, full_circle_faces), (sampled_faces, sampled_coeff) = sample_submesh_points(full_circle_vertices, full_circle_faces, selected_faces, npoints = points_to_sample, generator = generator)
+        
+        # convert sampled_faces to main mesh space
+        sampled_faces = original_faces[sampled_faces]
+        
+        # check if points are at the correct distance from current center
+        geoalg = distance_graph(full_circle_vertices, full_circle_faces)
+        good_points = full_circle_vertices.shape[0] - np.arange(points_to_sample, 0, -1)
+        dists = edge_distances(distance_graph, [source], good_points)[0]
+        good_points = good_points[(dists>min_dist)&(dists<2*min_dist)]
+        
+        if len(good_points>0):
+            # check which points are at the correct distance from each other
+            dist_matrix = compute_graph_dist_matrix(geoalg, good_points)
+            tokeep = [0]
+            for i in range(1,len(good_points)):
+                if dist_matrix[tokeep, i].min()>min_dist:
+                    tokeep.append(i)
+            good_points = good_points[tokeep]-full_circle_vertices.shape[0]+points_to_sample
+        
+        # add the good points so far to the main mesh
+        sampled_points = points_from_coeffs(vertices, faces, sampled_faces[good_points], sampled_coeff[good_points])
+        vertices, faces = add_points(vertices, faces, sampled_points, sampled_faces[good_points])
+        good_points = np.arange(vertices.shape[0]-len(good_points), vertices.shape[0]).tolist()
+        
+        ##### check if points are good wrt to main mesh
+
+        # create submesh with radius 3*min_dist around current point to speed up computations
+        # select a subset of vertices using euclidean distance
+        dists = np.linalg.norm(vertices-vertices[point], axis = -1)
+        selected_vertices = np.asarray(dists<3*min_dist).nonzero()[0]
+        
+        # create euclidean submesh
+        selected_faces = faces[np.any(np.any(selected_vertices == faces[...,np.newaxis], axis = -1), axis = -1)]
+        selected_faces = select_connected_faces(selected_faces, point)
+        submesh_vertices, submesh_faces, selected_vertices = create_submesh(vertices, selected_faces)
+        
+        # find already sampled points in submesh space
+        _, points_indices, _ = np.intersect1d(selected_vertices, sampled_dipoles, assume_unique=True, return_indices=True)    
+        old_points_to_check = np.arange(len(selected_vertices))[points_indices]
+        
+        # find points to test in submesh space (the difference with above is due to the fact that I already know that good_points is inside selected_vertices)
+        points_indices = np.nonzero( selected_vertices == np.array(good_points)[:,np.newaxis] )[1]
+        new_points_to_check = np.arange(len(selected_vertices), dtype = np.int32)[points_indices]
+        
+        # compute geodesic distances on the subset
+        geoalg = distance_graph(submesh_vertices, submesh_faces)
+        tokeep = []
+        for i,p in enumerate(new_points_to_check):
+            dists = edge_distances([p], old_points_to_check)[0]
+            if dists.min()>min_dist:
+                tokeep.append(good_points[i])
+                Q.append(good_points[i])
+        sampled_dipoles += tokeep
+        
+        ###################################
+        
+        # OLD
+        # if len(tokeep)>=points_to_sample-max_rejections:
+        #     raise ValueError('Too few rejections!!!')
+        
+        # update progress bar
+        iter += 1
+        pbar.update(len(tokeep))
+    pbar.close()
+    
+    
+    return vertices, faces, sampled_dipoles
