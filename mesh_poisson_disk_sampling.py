@@ -287,7 +287,7 @@ def compute_dist_matrix(geoalg, vertices):
     
     return out
 
-def poisson_disk_sampling(vertices, faces, min_dist, num_points = None, seed_vertices = None, remesh = False, generator = None):
+def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, seed_vertices = None, remesh = False, generator = None):
     """
         vertices: array (n_vertices, 3), vertices array of the mesh
         faces: array (n_faces, 3), faces array of the mesh
