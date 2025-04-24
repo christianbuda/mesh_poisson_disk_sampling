@@ -1,5 +1,5 @@
 import numpy as np
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 from collections import deque
 import trimesh
 import networkx as nx
@@ -87,47 +87,31 @@ def triangle_area(A,B,C):
     # A,B,C can be array of arrays of dimensions (N,3)
     return(np.linalg.norm(np.cross(B-A, C-A), axis = -1)/2)
 
+def points_from_coeffs(vertices, faces, sampled_faces, sampled_coeff):
+    # computes sampled points coordinates from trilinear local coordinates values
+    return np.sum(vertices[faces[sampled_faces]]*np.broadcast_to(sampled_coeff[...,np.newaxis], (len(sampled_faces),3,3)), axis = 1)
 
-def add_points(vertices, faces, sampled_points, sampled_faces):
-    # add sampled points and faces to the mesh
-    
-    # NOTE: this function can only add one point per triangle at a time!
-    if np.any(np.unique(sampled_faces, return_counts = True)[1]>1):
-        raise ValueError('add_points() only works when there is a single point per triangle to be added, found more than once here. Try refining the mesh or use _safe_add_points().')
-    
-    sampled_points_idx = np.arange(vertices.shape[0], vertices.shape[0] + sampled_points.shape[0])
-    vertices = np.concatenate([vertices, sampled_points])
-    
-    # add the faces
-    # B C D
-    t1 = np.concatenate([faces[sampled_faces,1:], sampled_points_idx[:,np.newaxis]], axis = -1)
-    # A D C
-    t2 = np.concatenate([faces[sampled_faces,:1], sampled_points_idx[:,np.newaxis], faces[sampled_faces,2:]], axis = -1)
-    
-    faces = np.concatenate([faces, t1, t2])
-    
-    # replace first face
-    faces[sampled_faces,2] = sampled_points_idx
-    
-    return vertices, faces
-
-
-def sample_mesh_points(vertices, faces, npoints = 30, generator = None):
+def sample_mesh_points(vertices, faces, npoints, faces_to_sample = None, generator = None, return_sampled_faces = False, return_sampled_coeffs = False):
     # sample npoints uniformly on the input mesh and add vertices in those points
     # NOTE: this is done by sampling faces based on areas, and then by sampling uniformly inside the triangle
-    #       it's only uniform if npoints << len(faces)
+    # if faces_to_sample is not None, points are only sampled in the subset of faces specified
     # returns a new mesh in which the sampled vertices are the last npoints rows in vertices
+
+
 
     if generator is None:
         generator = np.random.default_rng()
 
-    A = vertices[faces[:,0]]
-    B = vertices[faces[:,1]]
-    C = vertices[faces[:,2]]
+    if faces_to_sample is None:
+        faces_to_sample = np.arange(len(faces))
+    
+    A = vertices[faces[faces_to_sample,0]]
+    B = vertices[faces[faces_to_sample,1]]
+    C = vertices[faces[faces_to_sample,2]]
 
     p = triangle_area(A, B, C)
     p /= p.sum()
-    sampled_faces = generator.choice(faces.shape[0], size = npoints, p = p, replace=False)
+    sampled_faces = generator.choice(faces_to_sample, size = npoints, p = p, replace = True)
 
     beta, gamma = tuple(generator.uniform(size = (2, npoints)))
 
@@ -145,13 +129,15 @@ def sample_mesh_points(vertices, faces, npoints = 30, generator = None):
     # sampled_points = alpha[:,np.newaxis]*A+beta[:,np.newaxis]*B+gamma[:,np.newaxis]*C
     
     sampled_points = points_from_coeffs(vertices, faces, sampled_faces, sampled_coeff)
+    
+    extra_outs = ()
+    if return_sampled_faces:
+        extra_outs += (sampled_faces,)
+    if return_sampled_coeffs:
+        extra_outs += (sampled_coeffs,)
+    
 
-    return add_points(vertices, faces, sampled_points, sampled_faces)
-
-def points_from_coeffs(vertices, faces, sampled_faces, sampled_coeff):
-    # computes sampled points coordinates from trilinear local coordinates values
-    return np.sum(vertices[faces[sampled_faces]]*np.broadcast_to(sampled_coeff[...,np.newaxis], (len(sampled_faces),3,3)), axis = 1)
-
+    return add_points(vertices, faces, sampled_points, sampled_faces) + extra_outs
 
 def get_submesh_faces(vertices, faces, source, radius, method = 'any'):
     # creates a submesh with all points at a distance 2*radius
@@ -200,7 +186,7 @@ def get_submesh_faces(vertices, faces, source, radius, method = 'any'):
 
     return full_circle_vertices, full_circle_faces, source, selected_faces, original_faces
 
-def select_connected_faces(faces, source):
+def select_connected_faces(faces, source, return_index = False):
     # NOTE: face_adjacency returns a list of indices of faces that are adjacent
     adj = trimesh.graph.face_adjacency(faces)
     
@@ -216,7 +202,10 @@ def select_connected_faces(faces, source):
     for g in groups:
         # if the connected component is the right one
         if base_triangle in g:
-            return(faces[list(g)])
+            if not return_index:
+                return(faces[list(g)])
+            else:
+                return(faces[list(g)], list(g))
     
     raise BaseException('Connected component not found, something went horribly wrong...')
 
@@ -233,42 +222,6 @@ def create_submesh(vertices, faces):
     newfaces = newfaces.sum(axis = -1)
     
     return vertices[interesting_vertices], newfaces, interesting_vertices
-
-def sample_submesh_points(vertices, faces, faces_to_sample, npoints = 30, generator = None):
-    # sample npoints on the input mesh and add vertices in those points
-    # returns a new mesh in which the sampled vertices are the last npoints rows in vertices
-
-    if generator is None:
-        generator = np.random.default_rng()
-
-    A = vertices[faces[faces_to_sample,0]]
-    B = vertices[faces[faces_to_sample,1]]
-    C = vertices[faces[faces_to_sample,2]]
-
-    p = triangle_area(A, B, C)
-    p /= p.sum()
-    sampled_faces = generator.choice(faces_to_sample, size = npoints, p = p, replace = False)
-
-    beta, gamma = tuple(generator.uniform(size = (2, npoints)))
-
-    # bring sampled points inside triangles
-    beta[beta+gamma>1] = 1 - beta[beta+gamma>1]
-    gamma[beta+gamma>1] = 1 - gamma[beta+gamma>1]
-    alpha = 1-beta-gamma
-    
-    sampled_coeff = np.stack([alpha, beta, gamma], axis = -1)
-
-    # ### OLD
-    # A = vertices[faces[sampled_faces,0]]
-    # B = vertices[faces[sampled_faces,1]]
-    # C = vertices[faces[sampled_faces,2]]
-    # sampled_points = alpha[:,np.newaxis]*A+beta[:,np.newaxis]*B+gamma[:,np.newaxis]*C
-    
-    sampled_points = points_from_coeffs(vertices, faces, sampled_faces, sampled_coeff)
-    
-
-    return add_points(vertices, faces, sampled_points, sampled_faces), (sampled_faces, sampled_coeff)
-
 
 def compute_dist_matrix(geoalg, vertices):
     # compute distance matrix between list of vertices
@@ -287,12 +240,103 @@ def compute_dist_matrix(geoalg, vertices):
     
     return out
 
-def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, seed_vertices = None, remesh = False, generator = None):
+def compute_close_vertices(vertices, faces, source, dist):
+    # returns all vertices that are either closer than dist to the source vertex
+    # or all vertices that are directly connected to one of the above ones
+    
+    # compute mesh edges (each edge is repeated twice)
+    edges = faces[:, [0, 1, 1, 2, 2, 0]].reshape((-1, 2))
+
+    P1 = vertices[edges[:,0]]
+    P2 = vertices[edges[:,1]]
+
+    v = P2-P1
+
+    P = vertices[source]
+
+    # for numerical stability
+    epsilon = np.std(v)**2*1e-8
+    
+    # optimal value to compute the distance between source and line spanned by the segment
+    # i.e. the closest point to source that lies in the line spanned by P1 and P2 is  P1+t_min*(P2-P1)
+    t_min = np.sum((P-P1)*v, axis = -1)/(np.sum(v**2, axis = -1)+epsilon)
+    
+    # clip the value to get a point inside the segment
+    t_min = np.clip(t_min, a_min = 0, a_max = 1)
+
+    # computes distance and selects the close ones
+    selected_vertices = np.unique(edges[np.linalg.norm(t_min[:,np.newaxis]*v+P1-P, axis = -1)<dist])
+    return selected_vertices
+
+def compute_close_faces(vertices, faces, source, radius, fine_mesh = True, method = 'any'):
+    # creates a submesh with all points at a distance 2*radius
+    # and selects faces in the ring of distance [radius, 2*radius]
+
+    if method == 'any':
+        reducer = np.any
+    elif method == 'all':
+        reducer = np.all
+
+    # select a subset of vertices using euclidean distance
+    if fine_mesh:
+        dists = np.linalg.norm(vertices-vertices[source], axis = -1)
+        selected_vertices = np.asarray(dists<2*radius).nonzero()[0]
+    else:
+        selected_vertices = compute_close_vertices(vertices, faces, source, 2*radius)
+        
+    # create euclidean submesh
+    selected_faces_idx = reducer(np.any(selected_vertices == faces[...,np.newaxis], axis = -1), axis = -1)
+    selected_faces = faces[selected_faces_idx]
+    original_faces = np.arange(len(faces))[selected_faces_idx]
+    
+    selected_faces, selected_faces_idx = select_connected_faces(selected_faces, source, return_index = True)
+    original_faces = original_faces[selected_faces_idx]
+    full_circle_vertices, full_circle_faces, selected_vertices = create_submesh(vertices, selected_faces)
+    
+    # keep track of source in the euclidean submesh space
+    source = np.asarray(selected_vertices == source).nonzero()[0][0]
+    
+    # compute geodesic distances on the subset
+    geoalg = geodesic.PyGeodesicAlgorithmExact(full_circle_vertices, full_circle_faces)
+    dists = geoalg.geodesicDistances([source])[0]
+
+    if fine_mesh:
+        original_vertices = selected_vertices[dists<2*radius]   # vertices of the full circle submesh in the original mesh space
+
+        # create full circle submesh
+        selected_vertices = np.asarray(dists<2*radius).nonzero()[0]    # vertices of the full circle submesh in the euclidean submesh space
+        selected_faces_idx = reducer(np.any(selected_vertices == full_circle_faces[...,np.newaxis], axis = -1), axis = -1)
+        selected_faces = full_circle_faces[selected_faces_idx]
+        original_faces = original_faces[selected_faces_idx]
+        
+        selected_faces, selected_faces_idx = select_connected_faces(selected_faces, source, return_index = True)
+        original_faces = original_faces[selected_faces_idx]
+        full_circle_vertices, full_circle_faces, selected_vertices = create_submesh(full_circle_vertices, selected_faces)
+        
+        # keep track of source in the full circle submesh space
+        source = np.asarray(selected_vertices == source).nonzero()[0][0]
+        
+        dists = dists[selected_vertices]   # convert dists vector to full circle mesh space
+    else:
+        original_vertices = selected_vertices.copy()   # vertices of the full circle submesh in the original mesh space
+    
+
+    # vertices of the ring in the full circle submesh space
+    selected_vertices = np.asarray(dists>radius).nonzero()[0]
+    selected_faces = reducer(np.any(selected_vertices == full_circle_faces[...,np.newaxis], axis = -1), axis = -1).nonzero()[0]
+
+    # faces of the full circle submesh in the original mesh space
+    # original_faces = reducer(np.any(original_vertices == faces[...,np.newaxis], axis = -1), axis = -1).nonzero()[0]
+
+    return full_circle_vertices, full_circle_faces, source, selected_faces, original_faces
+
+def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, points_to_sample = None, seed_vertices = None, remesh = False, generator = None, verbose = False):
     """
         vertices: array (n_vertices, 3), vertices array of the mesh
         faces: array (n_faces, 3), faces array of the mesh
         min_dist: float, minimum distance between the points of the poisson sampling
         num_points: (optional) int, rough number of points to sample, if min_dist is None, this should be given
+        points_to_sample: points to sample in each disk
         seed_vertices: (optional) list of int, index of the vertices that should be included in the final sampling
         remesh: boolean, whether or not to apply a flat remeshing strategy. This will increase the quality of the sampling, but lower the speed of the algorithm
                 NOTE: sometimes it does not work, try upsampling with something more robust
@@ -311,20 +355,43 @@ def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, s
     total_area = triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).sum()
     if min_dist is not None:
         num_points = int(0.5*total_area/min_dist**2)  # rough estimate, the 0.5 is empirical
+        if verbose:
+            print(f'Sampling about {num_points} points with a minimum distance of {min_dist}')
+            
     elif min_dist is None:
         assert num_points is not None, 'If min_dist is None, num_points must be not None'
         min_dist = np.sqrt(0.5*total_area/num_points)
         
-        
+        if verbose:
+            print(f'Sampling about {num_points} points with an estimated minimum distance of {min_dist}')
+    
+    if points_to_sample is None:
+        # heuristics
+        points_to_sample = int(30*np.max([(triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).max()-np.pi*min_dist**2)/(3*np.pi*min_dist**2), 1]))
+    
+    if verbose:
+        print(f'Number of points sampled in each disk: {points_to_sample}')
+    
+    
+    # variable that determines whether the mesh is fine enough for an accurate sampling
+    fine_mesh = edge_lengths(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).mean()/min_dist
+    if verbose:
+        print(f'Mesh is{'' if fine_mesh<1 else ' not'} fine enough, with a coefficient of {fine_mesh}')
+    # mesh is fine if fine_mesh<<1 (i.e. if a sphere of radius min_dist around a typical vertex contains many faces)
+    fine_mesh = fine_mesh<1
+    
+    
     Q = deque()
 
     if seed_vertices is None:
         # sample first point
-        vertices, faces = sample_mesh_points(vertices, faces, npoints = 1, generator = generator)
-
-        sampled_dipoles = [vertices.shape[0]-1]
-
-        Q.append(vertices.shape[0]-1)
+        vertices, faces, sampled_dipoles = sample_mesh_points(vertices, faces, npoints = 1, generator = generator)
+        sampled_dipoles = sampled_dipoles.tolist()
+        
+        Q.append(sampled_dipoles[0])
+        
+        if verbose:
+            print(f'Starting sampling with vertex: {sampled_dipoles[0]}, with coordinates {vertices[sampled_dipoles[0]]}')
     else:
         if not isinstance(seed_vertices, np.ndarray):
             assert isinstance(seed_vertices, list), 'Seed vertices must be a list of mesh vertices'
@@ -334,6 +401,9 @@ def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, s
         for v in seed_vertices:
             sampled_dipoles.append(v)
             Q.append(v)
+        
+        if verbose:
+            print(f'Starting sampling with {len(seed_vertices)} seed vertices: {seed_vertices}, with coordinates {vertices[seed_vertices]}')
 
 
     iter = 0
@@ -346,20 +416,19 @@ def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, s
         point = Q.popleft()
         
         # create circular submesh from which to sample
-        full_circle_vertices, full_circle_faces, source, selected_faces, original_faces = get_submesh_faces(vertices, faces, point, min_dist, method = 'any')
-        points_to_sample = len(selected_faces)
+        full_circle_vertices, full_circle_faces, source, selected_faces, original_faces = compute_close_faces(vertices, faces, point, min_dist, fine_mesh = fine_mesh, method = 'any')
         
         # sample points
-        (full_circle_vertices, full_circle_faces), (sampled_faces, sampled_coeff) = sample_submesh_points(full_circle_vertices, full_circle_faces, selected_faces, npoints = points_to_sample, generator = generator)
+        full_circle_vertices, full_circle_faces, good_points, sampled_faces = sample_mesh_points(full_circle_vertices, full_circle_faces, faces_to_sample = selected_faces, npoints = points_to_sample, generator = generator, return_sampled_faces = True)
         
         # convert sampled_faces to main mesh space
         sampled_faces = original_faces[sampled_faces]
         
         # check if points are at the correct distance from current center
         geoalg = geodesic.PyGeodesicAlgorithmExact(full_circle_vertices, full_circle_faces)
-        good_points = full_circle_vertices.shape[0] - np.arange(points_to_sample, 0, -1)
         dists = geoalg.geodesicDistances([source], good_points)[0]
         good_points = good_points[(dists>min_dist)&(dists<2*min_dist)]
+        sampled_faces = sampled_faces[(dists>min_dist)&(dists<2*min_dist)]
 
         if len(good_points)>0:
             # check which points are at the correct distance from each other
@@ -368,12 +437,11 @@ def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, s
             for i in range(1,len(good_points)):
                 if dist_matrix[tokeep, i].min()>min_dist:
                     tokeep.append(i)
-            good_points = good_points[tokeep]-full_circle_vertices.shape[0]+points_to_sample
+            good_points = good_points[tokeep]
+            sampled_faces = sampled_faces[tokeep]
         
         # add the good points so far to the main mesh
-        sampled_points = points_from_coeffs(vertices, faces, sampled_faces[good_points], sampled_coeff[good_points])
-        vertices, faces = add_points(vertices, faces, sampled_points, sampled_faces[good_points])
-        good_points = np.arange(vertices.shape[0]-len(good_points), vertices.shape[0]).tolist()
+        vertices, faces, good_points = add_points(vertices, faces, full_circle_vertices[good_points], sampled_faces)
         
         ##### check if points are good wrt to main mesh
 
@@ -441,8 +509,7 @@ def uniform_sampling(vertices, faces, num_points, remesh = False, generator = No
         print('Performing flat remeshing on input mesh...')
         vertices, faces = flat_remeshing(vertices, faces)
 
-    vertices, faces =  sample_mesh_points(vertices, faces, npoints = num_points, generator = generator)
-    sampled_points = np.arange(len(vertices)-num_points, len(vertices))
+    vertices, faces, sampled_points =  sample_mesh_points(vertices, faces, npoints = num_points, generator = generator)
     return vertices, faces, sampled_points
 
 
@@ -493,12 +560,13 @@ def compute_graph_dist_matrix(G, vertices):
     return out
 
 
-def edge_distance_poisson_disk_sampling(vertices, faces, min_dist, num_points = None, seed_vertices = None, remesh = False, generator = None):
+def edge_distance_poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, points_to_sample = None, seed_vertices = None, remesh = False, generator = None, verbose = False):
     """
         vertices: array (n_vertices, 3), vertices array of the mesh
         faces: array (n_faces, 3), faces array of the mesh
         min_dist: float, minimum distance between the points of the poisson sampling
         num_points: (optional) int, rough number of points to sample, if min_dist is None, this should be given
+        points_to_sample: points to sample in each disk
         seed_vertices: (optional) list of int, index of the vertices that should be included in the final sampling
         remesh: boolean, whether or not to apply a flat remeshing strategy. This will increase the quality of the sampling, but lower the speed of the algorithm
                 NOTE: sometimes it does not work, try upsampling with something more robust
@@ -517,20 +585,44 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist, num_points = 
     total_area = triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).sum()
     if min_dist is not None:
         num_points = int(0.5*total_area/min_dist**2)  # rough estimate, the 0.5 is empirical
+        if verbose:
+            print(f'Sampling about {num_points} points with a minimum distance of {min_dist}')
+            
     elif min_dist is None:
         assert num_points is not None, 'If min_dist is None, num_points must be not None'
         min_dist = np.sqrt(0.5*total_area/num_points)
         
-        
+        if verbose:
+            print(f'Sampling about {num_points} points with an estimated minimum distance of {min_dist}')
+    
+    
+    if points_to_sample is None:
+        # heuristics
+        points_to_sample = int(30*np.max([(triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).max()-np.pi*min_dist**2)/(3*np.pi*min_dist**2), 1]))
+    
+    if verbose:
+        print(f'Number of points sampled in each disk: {points_to_sample}')
+    
+    
+    # variable that determines whether the mesh is fine enough for an accurate sampling
+    fine_mesh = edge_lengths(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).mean()/min_dist
+    if verbose:
+        print(f'Mesh is{'' if fine_mesh<1 else ' not'} fine enough, with a coefficient of {fine_mesh}')
+    # mesh is fine if fine_mesh<<1 (i.e. if a sphere of radius min_dist around a typical vertex contains many faces)
+    fine_mesh = fine_mesh<1
+    
+    
     Q = deque()
 
     if seed_vertices is None:
         # sample first point
-        vertices, faces = sample_mesh_points(vertices, faces, npoints = 1, generator = generator)
-
-        sampled_dipoles = [vertices.shape[0]-1]
-
-        Q.append(vertices.shape[0]-1)
+        vertices, faces, sampled_dipoles = sample_mesh_points(vertices, faces, npoints = 1, generator = generator)
+        sampled_dipoles = sampled_dipoles.tolist()
+        
+        Q.append(sampled_dipoles[0])
+        
+        if verbose:
+            print(f'Starting sampling with vertex: {sampled_dipoles[0]}, with coordinates {vertices[sampled_dipoles[0]]}')
     else:
         if not isinstance(seed_vertices, np.ndarray):
             assert isinstance(seed_vertices, list), 'Seed vertices must be a list of mesh vertices'
@@ -540,6 +632,9 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist, num_points = 
         for v in seed_vertices:
             sampled_dipoles.append(v)
             Q.append(v)
+        
+        if verbose:
+            print(f'Starting sampling with {len(seed_vertices)} seed vertices: {seed_vertices}, with coordinates {vertices[seed_vertices]}')
 
 
     iter = 0
@@ -552,34 +647,32 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist, num_points = 
         point = Q.popleft()
         
         # create circular submesh from which to sample
-        full_circle_vertices, full_circle_faces, source, selected_faces, original_faces = get_submesh_faces(vertices, faces, point, min_dist, method = 'any')
-        points_to_sample = len(selected_faces)
+        full_circle_vertices, full_circle_faces, source, selected_faces, original_faces = compute_close_faces(vertices, faces, point, min_dist, method = 'any')        
         
         # sample points
-        (full_circle_vertices, full_circle_faces), (sampled_faces, sampled_coeff) = sample_submesh_points(full_circle_vertices, full_circle_faces, selected_faces, npoints = points_to_sample, generator = generator)
+        full_circle_vertices, full_circle_faces, good_points, sampled_faces = sample_mesh_points(full_circle_vertices, full_circle_faces, faces_to_sample = selected_faces, npoints = points_to_sample, generator = generator, return_sampled_faces = True)
         
         # convert sampled_faces to main mesh space
         sampled_faces = original_faces[sampled_faces]
         
         # check if points are at the correct distance from current center
         geoalg = distance_graph(full_circle_vertices, full_circle_faces)
-        good_points = full_circle_vertices.shape[0] - np.arange(points_to_sample, 0, -1)
         dists = edge_distances(geoalg, [source], good_points)[0]
         good_points = good_points[(dists>min_dist)&(dists<2*min_dist)]
+        sampled_faces = sampled_faces[(dists>min_dist)&(dists<2*min_dist)]
         
-        if len(good_points>0):
+        if len(good_points)>0:
             # check which points are at the correct distance from each other
             dist_matrix = compute_graph_dist_matrix(geoalg, good_points)
             tokeep = [0]
             for i in range(1,len(good_points)):
                 if dist_matrix[tokeep, i].min()>min_dist:
                     tokeep.append(i)
-            good_points = good_points[tokeep]-full_circle_vertices.shape[0]+points_to_sample
+            good_points = good_points[tokeep]
+            sampled_faces = sampled_faces[tokeep]
         
         # add the good points so far to the main mesh
-        sampled_points = points_from_coeffs(vertices, faces, sampled_faces[good_points], sampled_coeff[good_points])
-        vertices, faces = add_points(vertices, faces, sampled_points, sampled_faces[good_points])
-        good_points = np.arange(vertices.shape[0]-len(good_points), vertices.shape[0]).tolist()
+        vertices, faces, good_points = add_points(vertices, faces, full_circle_vertices[good_points], sampled_faces)
         
         ##### check if points are good wrt to main mesh
 
@@ -624,3 +717,367 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist, num_points = 
     
     
     return vertices, faces, sampled_dipoles
+
+
+
+##################### add points utils
+def project_pointcloud_on_faces(points, vertices, faces):
+    # this function provides the projection of the input point cloud on each triangle of the input mesh
+    # it is unnecessarily convoluted to allow the use of the autograd package to compute gradients
+
+    # (N_faces, N_vertex_per_face, 3)
+    vertices_groups = vertices[faces]
+    N_faces = faces.shape[0]
+    N_points = points.shape[0]
+
+    A = vertices_groups[:,0]
+    B = vertices_groups[:,1]
+    C = vertices_groups[:,2]
+
+    R = create_rotation_matrices(np.cross(B-A, C-A))[np.newaxis]
+
+    # add starting dimension to allow easier broadcasting for point cloud
+    vertices_groups = np.broadcast_to(vertices_groups, (N_points,N_faces,3,3))
+    A = A[np.newaxis]
+    B = B[np.newaxis]
+    C = C[np.newaxis]
+
+    # this projects point P on the plane spanned by each triangle
+    coeffs = np.linalg.inv(R[:,:,:2]@np.stack([B-A, C-A], axis = -1))@((R@(points[:,np.newaxis]-A)[...,np.newaxis])[:,:,:2])
+
+    # coefficients of the trilinear coordinates that make up the projection on the triangle
+    coeffs = np.array([[[[1], [0], [0]]]]) + np.array([[[[-1, -1], [1,0], [0,1]]]])@coeffs
+
+    # # these are the actual projected points on the planes, the formula above is to find directly the trilinear coordinates
+    # proj_P = np.squeeze(np.linalg.inv(R)@np.array([[[[1,0,0], [0,1,0], [0,0,0]]]])@R@(points[:,np.newaxis]-A)[..., np.newaxis])+A
+    proj_P = np.sum(coeffs*vertices_groups, axis = 2)
+
+    # check how many have exactly one negative coefficient
+    pos_coeffs = coeffs[...,0]>0
+    which_to_project = np.sum(pos_coeffs, axis = -1) == 2
+
+    # this is a mask on coeffs that is equal to pos_coeffs in points that need to be projected, and is equal to [True, True, False] for all other points
+    # it's a trick necessary to avoid item assignment as it is incompatible with autograd
+    segments_endpoint = np.where(which_to_project[...,np.newaxis], pos_coeffs, np.ones(pos_coeffs.shape, dtype = bool)*np.array([[[1,1,0]]], dtype = bool))
+
+    # once we have the mask, we can extract the indices
+    index_points, index_faces, index_ending = np.nonzero(segments_endpoint)
+    index_points = index_points[::2]
+    index_faces = index_faces[::2]
+    index_starting = index_ending[::2]
+    index_ending = index_ending[1::2]
+
+    # and the segments; keep in mind that these segments are only meaningful for the points that need line projection!
+    line = vertices_groups[index_points, index_faces, index_ending].reshape((N_points,N_faces,3)) - vertices_groups[index_points, index_faces, index_starting].reshape((N_points,N_faces,3))
+
+    # Use these masks as a trick to avoid item assignment
+    # startpoints mask is True on the starting point of each segment (as defined in segments_endpoint)
+    startpoints_mask = np.zeros((coeffs.shape))
+    startpoints_mask[index_points, index_faces, index_starting] = 1
+    # endpoints mask is True on the ending point of each segment (as defined in segments_endpoint)
+    endpoints_mask = np.zeros((coeffs.shape))
+    endpoints_mask[index_points, index_faces, index_ending] = 1
+
+    # this is the coefficient of the new projected point, relative to the starting vertex
+    # the coefficient relative to the ending vertex is its complement to 1 (i.e. 1-startingcoeff)
+    tmp = (np.sum((proj_P-vertices_groups[index_points, index_faces, index_starting].reshape((N_points,N_faces,3)))*line, axis = -1)/np.linalg.norm(line, axis = -1)**2)[:,:,np.newaxis, np.newaxis]
+    coeffs = (endpoints_mask*tmp + startpoints_mask*(1-tmp))*which_to_project[..., np.newaxis, np.newaxis] + coeffs*np.logical_not(which_to_project)[..., np.newaxis, np.newaxis]
+
+    coeffs = np.clip(coeffs, 0, 1)
+    coeffs = coeffs/np.sum(coeffs, axis = -2)[...,np.newaxis]
+
+    proj_P = np.sum(coeffs*vertices_groups, axis = 2)
+
+    return proj_P
+
+
+def create_rotation_matrices(v, target = 'z'):
+    # create a set of rotation matrices in 3D space in such a way that the list of vectors v are each rotated along the target direction
+    # multidimensional version of "create_rotation_matrix"
+    
+    v = np.array(v, dtype=float)
+    
+    v_norm = np.linalg.norm(v, axis = 1)
+    
+    if np.any(v_norm == 0):
+        raise ValueError("Some vectors in the array are null and cannot be rotated.")
+    
+    v = v / v_norm[...,np.newaxis]  # Normalize v
+    
+    if isinstance(target, str):
+        if target == 'z':
+            target = np.array([0, 0, 1])  # z-axis
+        elif target == 'y':
+            target = np.array([0, 1, 0])  # z-axis
+        elif target == 'x':
+            target = np.array([1, 0, 0])  # z-axis
+        else:
+            raise ValueError("target must be either a vector or one of ['x', 'y', 'z']")
+    else:
+        target = np.array(target, dtype=float)
+    
+        target_norm = np.linalg.norm(target)
+        
+        if np.isclose(target_norm, 0):
+            raise ValueError("Zero vector cannot be a target.")
+        
+        target = target / target_norm  # Normalize target
+        
+    R = np.zeros((v.shape[0], 3, 3))
+    
+    
+    # Compute rotation axes (cross product of v and target)
+    axes = np.cross(v, target)
+    axes_norm = np.linalg.norm(axes, axis = 1)
+    axes /= axes_norm[...,np.newaxis]  # Normalize rotation axis
+    
+    # Compute rotation angle
+    thetas = np.arccos(np.dot(v, target))[...,np.newaxis, np.newaxis]
+    
+    # as described in https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula
+    R = axes[:, 2, np.newaxis, np.newaxis] * np.array([[[0,-1,0], [1,0,0], [0,0,0]]]) + axes[:, 1, np.newaxis, np.newaxis] * np.array([[[0,0,1], [0,0,0], [-1,0,0]]]) + axes[:, 0, np.newaxis, np.newaxis] * np.array([[[0,0,0], [0,0,-1], [0,1,0]]])
+    
+    R = np.eye(3)[np.newaxis] + np.sin(thetas) * R + (1 - np.cos(thetas)) * np.matmul(R,R)
+    
+    return R
+
+def add_internal_points(vertices, faces, sampled_points, sampled_faces):
+    # add sampled points and faces to the mesh
+    # make sure points are internal to the faces (and not on the boundary)
+    # generally faster than add_points()
+    
+    # NOTE: this function can only add one point per triangle at a time!
+    if np.any(np.unique(sampled_faces, return_counts = True)[1]>1):
+        raise ValueError('add_internal_points() only works when there is a single point per triangle to be added, found more than once here. Try refining the mesh or use add_points().')
+    
+    sampled_points_idx = np.arange(vertices.shape[0], vertices.shape[0] + sampled_points.shape[0])
+    vertices = np.concatenate([vertices, sampled_points])
+    
+    # add the faces
+    # B C D
+    t1 = np.concatenate([faces[sampled_faces,1:], sampled_points_idx[:,np.newaxis]], axis = -1)
+    # A D C
+    t2 = np.concatenate([faces[sampled_faces,:1], sampled_points_idx[:,np.newaxis], faces[sampled_faces,2:]], axis = -1)
+    
+    faces = np.concatenate([faces, t1, t2])
+    
+    # replace first face
+    faces[sampled_faces,2] = sampled_points_idx
+    
+    return vertices, faces
+
+def find_close_points(vertices, points):
+    # checks if any point in points is very close to a vertex
+    
+    rtol = 1e-5
+    which_close = np.isclose(vertices[np.newaxis],points[:,np.newaxis], rtol = rtol).all(axis = -1)
+    
+    iter = 0
+    while np.any(np.count_nonzero(which_close, axis =-1)>1):
+        iter += 1
+        
+        rtol *= 0.9
+        which_close = np.isclose(vertices[np.newaxis],points[:,np.newaxis], rtol = rtol).all(axis = -1)
+        
+        if iter>1000:
+            raise BaseException('There may be a double vertex, check the mesh!')
+    
+    return which_close
+
+def collinear(A,B,C, epsilon = 1e-2, return_value = False):
+    # checks if the 3D points A, B, C are collinear
+    # it does so by testing whether the distance between the middle point
+    # and the segment between the other two is less than epsilon times smaller than the length of the segment itself
+    
+    # A, B, C can be arrays of N points, of dimension (N,3)
+    
+    longest_edge = edge_lengths(A,B,C).max(axis = -1)
+    out = np.linalg.norm(np.cross(A-B, A-C), axis = -1)/longest_edge**2
+    if not return_value:
+        out = out<epsilon/2
+    return out
+
+
+def _add_collinear_point(A,B,C, vertices, faces, sampled_point, sampled_face):
+    # adds a point to face [A B C] by splitting edge [A B] a placing the sampled point in the middle
+    
+    D = vertices.shape[0]
+    vertices = np.concatenate([vertices, [sampled_point]])
+    
+    # new faces (where E is the vertex of the second face to which the edge [A B] belongs)
+    # A D C, D B C, A E D, B D E
+    
+    
+    second_face = np.nonzero((np.sum(np.any(faces[np.newaxis] == np.array([A,B])[...,np.newaxis, np.newaxis], axis = 0), axis = -1) == 2)&np.logical_not(np.any(faces == C, axis = -1)))[0]
+    if len(second_face)>0:
+        E = np.setdiff1d(faces[second_face], np.array([A,B]))[0]
+    
+        # D B C
+        t1 = np.array([[D,B,C]])
+        # B D E
+        t2 = np.array([[B,D,E]])
+        
+        faces = np.concatenate([faces, t1, t2])
+        faces[sampled_face] = [A,D,C]
+        faces[second_face] = [A,E,D]
+    else:
+        # D B C
+        t1 = np.array([[D,B,C]])
+        
+        faces = np.concatenate([faces, t1])
+        faces[sampled_face] = [A,D,C]
+    
+    return vertices, faces, D
+
+def add_single_point(vertices, faces, sampled_point, sampled_face):
+    # adds a single point to the mesh
+    # if collinear, it adds it by splitting the corresponding edge
+    
+    # WARNING: you should check if any point is equal to a vertex!!
+    
+    
+    A = faces[sampled_face, 0]
+    B = faces[sampled_face, 1]
+    C = faces[sampled_face, 2]
+
+    # check if point is collinear to some edge
+    if np.any([collinear(vertices[A], vertices[B], sampled_point), collinear(vertices[B], vertices[C], sampled_point), collinear(vertices[C], vertices[A], sampled_point)]):
+        which_coll=np.argmin(np.array([collinear(vertices[A], vertices[B], sampled_point, return_value=True), collinear(vertices[B], vertices[C], sampled_point, return_value=True), collinear(vertices[C], vertices[A], sampled_point, return_value=True)]))
+        
+        # adds the point to the closest edge
+        if which_coll==0:
+            return _add_collinear_point(A,B,C,vertices, faces, sampled_point, sampled_face)
+        elif which_coll == 1:
+            return _add_collinear_point(B,C,A,vertices, faces, sampled_point, sampled_face)
+        elif which_coll==2:
+            return _add_collinear_point(C,A,B,vertices, faces, sampled_point, sampled_face)
+    
+    # if here, the point is not collinear and can be added safely
+    return add_internal_points(vertices, faces, sampled_point[np.newaxis], sampled_face[np.newaxis])+(vertices.shape[0],)
+
+def _safe_add_points(vertices, faces, sampled_points, sampled_faces):
+    # subroutine of add_points(), to safely add points (duh..)
+    
+    nfaces = len(faces)
+    
+    # check if several points need to be added to the same face
+    _, unique_indices = np.unique(sampled_faces, return_index  = True)
+    
+    
+    # save position of added points
+    added_points = np.zeros(len(sampled_points), dtype = int)+len(vertices)
+    added_points[unique_indices] += np.arange(len(unique_indices))
+    
+    # add only first occurence of points
+    vertices, faces = add_internal_points(vertices, faces, sampled_points[unique_indices], sampled_faces[unique_indices])
+    
+    # select points that need to be projected again
+    left_out_points = np.setdiff1d(np.arange(len(sampled_points)), unique_indices)
+
+    if len(left_out_points)>0:
+        sampled_points = sampled_points[left_out_points]
+        
+        faces_to_check = np.concatenate([sampled_faces, np.arange(nfaces, len(faces))])
+        sampled_faces = closest_faces(sampled_points, vertices, faces[faces_to_check], return_faces=True)[1]
+        sampled_faces = faces_to_check[sampled_faces]
+        
+        # sampled_facestrue = closest_faces(sampled_points, vertices, faces, return_faces=True)[1]
+        
+        
+        vertices, faces, newly_added_pts =  add_points(vertices, faces, sampled_points, sampled_faces)
+        added_points[left_out_points] = newly_added_pts
+    
+    return vertices, faces, added_points
+
+def compute_collinearity_matrix(vertices, faces, sampled_points, sampled_faces):
+    # returns the collinearity matrix of every point
+    # i.e. a (len(sampled_points), 3) boolean matrix with the following properties:
+    #       - for each row, the number of True values is either one or zero
+    #       - if collinearity_matrix[i, 0] is True, then sampled_points[i] is collinear with A[i] and B[i]
+    #       - if collinearity_matrix[i, 1] is True, then sampled_points[i] is collinear with B[i] and C[i]
+    #       - if collinearity_matrix[i, 2] is True, then sampled_points[i] is collinear with C[i] and A[i]
+    
+    A = faces[sampled_faces, 0]
+    B = faces[sampled_faces, 1]
+    C = faces[sampled_faces, 2]
+
+    collinearity_matrix = np.stack([collinear(vertices[A], vertices[B], sampled_points), collinear(vertices[B], vertices[C], sampled_points), collinear(vertices[C], vertices[A], sampled_points)], axis = -1)
+    return collinearity_matrix
+
+
+def add_points(vertices, faces, sampled_points, sampled_faces):
+    # adds points to the mesh "safely", i.e. by splitting edges and joining to closest vertex if necessary
+    nfaces = len(faces)
+    
+    which_vertex = np.any(find_close_points(vertices, sampled_points), axis = -1)
+    
+    collinearity_matrix = compute_collinearity_matrix(vertices, faces, sampled_points, sampled_faces)
+    which_collinear = np.any(collinearity_matrix, axis = -1)
+    which_collinear[which_vertex] = False
+    which_not_collinear = np.logical_not(which_collinear)
+    which_not_collinear[which_vertex] = False
+    
+    
+    # add normal_points
+    vertices, faces, newly_added_points = _safe_add_points(vertices, faces, sampled_points[which_not_collinear], sampled_faces[which_not_collinear])
+    
+    
+    # save position of added points
+    added_points = np.zeros(len(sampled_points), dtype = int)
+    added_points[which_not_collinear] = newly_added_points
+    
+    # old
+    # which_collinear = np.sum(collinearity_matrix, axis = -1) == 1
+    # which_vertex = np.sum(collinearity_matrix, axis = -1) == 2
+    
+    # take care of points very close to vertices
+    if which_vertex.sum()>0:
+        added_points[which_vertex] = np.argmin(np.linalg.norm(sampled_points[which_vertex][np.newaxis]-vertices[:,np.newaxis], axis = -1), axis = 0)
+    
+    if which_collinear.sum()>0:
+        sampled_points = sampled_points[which_collinear]
+        
+        # sampled_facestrue = closest_faces(sampled_points, vertices, faces, return_faces=True)[1]
+        faces_to_check = np.concatenate([sampled_faces, np.arange(nfaces, len(faces))])
+        
+        sampled_faces = closest_faces(sampled_points, vertices, faces[faces_to_check], return_faces=True)[1]
+        
+        sampled_faces = faces_to_check[sampled_faces]
+        
+        # _, counts = np.unique(sampled_faces, return_counts  = True)
+        # if np.any(counts>2):
+        #     raise NotImplementedError('More than one collinear point in the same face, try remeshing or implement the logic to handle this.')
+        
+        
+        which_collinear = np.nonzero(which_collinear)[0]
+        
+        nfaces = len(faces)
+        
+        # add sampled points and faces to the mesh
+        for i in range(len(sampled_points)):
+            # project on faces
+            faces_to_check = np.concatenate([sampled_faces, np.arange(nfaces, len(faces))])
+            sampled_face = closest_faces(sampled_points[[i]], vertices, faces[faces_to_check], return_faces=True)[1][0]
+            sampled_face = faces_to_check[sampled_face]
+            
+            # sampled_facetrue = closest_faces(sampled_points[[i]], vertices, faces, return_faces=True)[1][0]
+            vertices, faces, added_pt = add_single_point(vertices, faces, sampled_points[i], sampled_face)
+            added_points[which_collinear[i]] = added_pt
+    
+    return vertices, faces, added_points
+
+
+def closest_faces(points, vertices, faces, return_faces = False):
+    # projects the input points on the mesh and returns the corresponding points and faces
+    # if return_faces is True, the index of the face on which the point was projected is returned
+
+    # from .point_projection import project_pointcloud_on_faces
+    all_proj = project_pointcloud_on_faces(points, vertices, faces)
+    picked_faces = np.linalg.norm(points[:,np.newaxis]-all_proj, axis = -1).argmin(axis = -1)
+    
+    # projected coordinates
+    out = all_proj[np.arange(len(points)),picked_faces]
+    
+    if return_faces:
+        out = (out, picked_faces)
+    return out
