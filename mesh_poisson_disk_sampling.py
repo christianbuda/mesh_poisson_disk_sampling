@@ -91,7 +91,7 @@ def points_from_coeffs(vertices, faces, sampled_faces, sampled_coeff):
     # computes sampled points coordinates from trilinear local coordinates values
     return np.sum(vertices[faces[sampled_faces]]*np.broadcast_to(sampled_coeff[...,np.newaxis], (len(sampled_faces),3,3)), axis = 1)
 
-def sample_mesh_points(vertices, faces, npoints, faces_to_sample = None, generator = None, return_sampled_faces = False, return_sampled_coeffs = False):
+def sample_mesh_points(vertices, faces, npoints, faces_to_sample = None, generator = None, return_sampled_faces = False, return_sampled_coeffs = False, return_face_tracker = False, face_tracker = None):
     # sample npoints uniformly on the input mesh and add vertices in those points
     # NOTE: this is done by sampling faces based on areas, and then by sampling uniformly inside the triangle
     # if faces_to_sample is not None, points are only sampled in the subset of faces specified
@@ -137,7 +137,7 @@ def sample_mesh_points(vertices, faces, npoints, faces_to_sample = None, generat
         extra_outs += (sampled_coeffs,)
     
 
-    return add_points(vertices, faces, sampled_points, sampled_faces) + extra_outs
+    return add_points(vertices, faces, sampled_points, sampled_faces, face_tracker = face_tracker, return_face_tracker=return_face_tracker) + extra_outs
 
 def get_submesh_faces(vertices, faces, source, radius, method = 'any'):
     # creates a submesh with all points at a distance 2*radius
@@ -330,7 +330,18 @@ def compute_close_faces(vertices, faces, source, radius, fine_mesh = True, metho
 
     return full_circle_vertices, full_circle_faces, source, selected_faces, original_faces
 
-def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, points_to_sample = None, seed_vertices = None, remesh = False, generator = None, verbose = False):
+class FaceTracker():
+    def __init__(self, nfaces):
+        self.tracker = np.arange(nfaces)
+    
+    def update_tracker(self, newfaces):
+        self.tracker = self.tracker[newfaces]
+    
+    def find_faces(self, faces):
+        return self.tracker[faces]
+
+
+def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, points_to_sample = None, seed_vertices = None, remesh = False, generator = None, return_original_faces = False, verbose = False):
     """
         vertices: array (n_vertices, 3), vertices array of the mesh
         faces: array (n_faces, 3), faces array of the mesh
@@ -380,13 +391,18 @@ def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, p
     # mesh is fine if fine_mesh<<1 (i.e. if a sphere of radius min_dist around a typical vertex contains many faces)
     fine_mesh = fine_mesh<1
     
+    # face_tracker object
+    nfaces = len(faces)
+    face_tracker = FaceTracker(nfaces)
     
     Q = deque()
 
     if seed_vertices is None:
         # sample first point
-        vertices, faces, sampled_dipoles = sample_mesh_points(vertices, faces, npoints = 1, generator = generator)
+        vertices, faces, sampled_dipoles, new_face_tracker, original_sampled_faces = sample_mesh_points(vertices, faces, npoints = 1, generator = generator, return_sampled_faces = True, return_face_tracker = True)
         sampled_dipoles = sampled_dipoles.tolist()
+        original_sampled_faces = original_sampled_faces.tolist()
+        face_tracker.update_tracker(new_face_tracker.tracker)
         
         Q.append(sampled_dipoles[0])
         
@@ -398,8 +414,10 @@ def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, p
         else:
             assert len(seed_vertices.shape) == 1 and seed_vertices.dtype == int, 'Seed vertices must be a list of mesh vertices'
         sampled_dipoles = []
+        original_sampled_faces = []
         for v in seed_vertices:
             sampled_dipoles.append(v)
+            original_sampled_faces.append(np.nan)
             Q.append(v)
         
         if verbose:
@@ -441,7 +459,7 @@ def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, p
             sampled_faces = sampled_faces[tokeep]
         
         # add the good points so far to the main mesh
-        vertices, faces, good_points = add_points(vertices, faces, full_circle_vertices[good_points], sampled_faces)
+        vertices, faces, good_points, new_face_tracker = add_points(vertices, faces, full_circle_vertices[good_points], sampled_faces, return_face_tracker=True)
         
         ##### check if points are good wrt to main mesh
 
@@ -466,12 +484,18 @@ def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, p
         # compute geodesic distances on the subset
         geoalg = geodesic.PyGeodesicAlgorithmExact(submesh_vertices, submesh_faces)
         tokeep = []
+        tokeep_facetracker = []
         for i,p in enumerate(new_points_to_check):
             dists = geoalg.geodesicDistances([p], old_points_to_check)[0]
             if dists.min()>min_dist:
                 tokeep.append(good_points[i])
+                tokeep_facetracker.append(sampled_faces[i])
                 Q.append(good_points[i])
         sampled_dipoles += tokeep
+        original_sampled_faces += face_tracker.find_faces(tokeep_facetracker).tolist()
+        
+        # update face tracker object
+        face_tracker.update_tracker(new_face_tracker.tracker)
         
         ###################################
         
@@ -484,11 +508,13 @@ def poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, p
         pbar.update(len(tokeep))
     pbar.close()
     
-    
-    return vertices, faces, sampled_dipoles
+    if return_original_faces:
+        return vertices, faces, sampled_dipoles, original_sampled_faces
+    else:
+        return vertices, faces, sampled_dipoles
 
 
-def uniform_sampling(vertices, faces, num_points, remesh = False, generator = None):
+def uniform_sampling(vertices, faces, num_points, remesh = False, return_original_faces = False, generator = None):
     """
     wrapper for sample_mesh_points()
     
@@ -509,8 +535,12 @@ def uniform_sampling(vertices, faces, num_points, remesh = False, generator = No
         print('Performing flat remeshing on input mesh...')
         vertices, faces = flat_remeshing(vertices, faces)
 
-    vertices, faces, sampled_points =  sample_mesh_points(vertices, faces, npoints = num_points, generator = generator)
-    return vertices, faces, sampled_points
+    vertices, faces, sampled_points, sampled_faces =  sample_mesh_points(vertices, faces, npoints = num_points, generator = generator, return_sampled_faces = True)
+    
+    if return_original_faces:
+        return vertices, faces, sampled_points, sampled_faces
+    else:
+        return vertices, faces, sampled_points
 
 
 def distance_graph(vertices, faces):
@@ -560,7 +590,7 @@ def compute_graph_dist_matrix(G, vertices):
     return out
 
 
-def edge_distance_poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, points_to_sample = None, seed_vertices = None, remesh = False, generator = None, verbose = False):
+def edge_distance_poisson_disk_sampling(vertices, faces, min_dist = None, num_points = None, points_to_sample = None, seed_vertices = None, remesh = False, generator = None, return_original_faces = False, verbose = False):
     """
         vertices: array (n_vertices, 3), vertices array of the mesh
         faces: array (n_faces, 3), faces array of the mesh
@@ -611,13 +641,18 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist = None, num_po
     # mesh is fine if fine_mesh<<1 (i.e. if a sphere of radius min_dist around a typical vertex contains many faces)
     fine_mesh = fine_mesh<1
     
+    # face_tracker object
+    nfaces = len(faces)
+    face_tracker = FaceTracker(nfaces)
     
     Q = deque()
 
     if seed_vertices is None:
         # sample first point
-        vertices, faces, sampled_dipoles = sample_mesh_points(vertices, faces, npoints = 1, generator = generator)
+        vertices, faces, sampled_dipoles, new_face_tracker, original_sampled_faces = sample_mesh_points(vertices, faces, npoints = 1, generator = generator, return_sampled_faces = True, return_face_tracker = True)
         sampled_dipoles = sampled_dipoles.tolist()
+        original_sampled_faces = original_sampled_faces.tolist()
+        face_tracker.update_tracker(new_face_tracker.tracker)
         
         Q.append(sampled_dipoles[0])
         
@@ -629,8 +664,10 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist = None, num_po
         else:
             assert len(seed_vertices.shape) == 1 and seed_vertices.dtype == int, 'Seed vertices must be a list of mesh vertices'
         sampled_dipoles = []
+        original_sampled_faces = []
         for v in seed_vertices:
             sampled_dipoles.append(v)
+            original_sampled_faces.append(np.nan)
             Q.append(v)
         
         if verbose:
@@ -672,7 +709,7 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist = None, num_po
             sampled_faces = sampled_faces[tokeep]
         
         # add the good points so far to the main mesh
-        vertices, faces, good_points = add_points(vertices, faces, full_circle_vertices[good_points], sampled_faces)
+        vertices, faces, good_points, new_face_tracker = add_points(vertices, faces, full_circle_vertices[good_points], sampled_faces, return_face_tracker=True)
         
         ##### check if points are good wrt to main mesh
 
@@ -697,12 +734,18 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist = None, num_po
         # compute geodesic distances on the subset
         geoalg = distance_graph(submesh_vertices, submesh_faces)
         tokeep = []
+        tokeep_facetracker = []
         for i,p in enumerate(new_points_to_check):
             dists = edge_distances(geoalg, [p], old_points_to_check)[0]
             if dists.min()>min_dist:
                 tokeep.append(good_points[i])
+                tokeep_facetracker.append(sampled_faces[i])
                 Q.append(good_points[i])
         sampled_dipoles += tokeep
+        original_sampled_faces += face_tracker.find_faces(tokeep_facetracker).tolist()
+        
+        # update face tracker object
+        face_tracker.update_tracker(new_face_tracker.tracker)
         
         ###################################
         
@@ -715,8 +758,10 @@ def edge_distance_poisson_disk_sampling(vertices, faces, min_dist = None, num_po
         pbar.update(len(tokeep))
     pbar.close()
     
-    
-    return vertices, faces, sampled_dipoles
+    if return_original_faces:
+        return vertices, faces, sampled_dipoles, original_sampled_faces
+    else:
+        return vertices, faces, sampled_dipoles
 
 
 
@@ -841,30 +886,40 @@ def create_rotation_matrices(v, target = 'z'):
     
     return R
 
-def add_internal_points(vertices, faces, sampled_points, sampled_faces):
+def add_internal_points(vertices, faces, sampled_points, sampled_faces, face_tracker = None):
     # add sampled points and faces to the mesh
     # make sure points are internal to the faces (and not on the boundary)
     # generally faster than add_points()
     
-    # NOTE: this function can only add one point per triangle at a time!
-    if np.any(np.unique(sampled_faces, return_counts = True)[1]>1):
-        raise ValueError('add_internal_points() only works when there is a single point per triangle to be added, found more than once here. Try refining the mesh or use add_points().')
+    if len(sampled_points)>0:
+        # NOTE: this function can only add one point per triangle at a time!
+        if np.any(np.unique(sampled_faces, return_counts = True)[1]>1):
+            raise ValueError('add_internal_points() only works when there is a single point per triangle to be added, found more than once here. Try refining the mesh or use add_points().')
+        
+        sampled_points_idx = np.arange(vertices.shape[0], vertices.shape[0] + sampled_points.shape[0])
+        vertices = np.concatenate([vertices, sampled_points])
+        
+        # add the faces
+        # B C D
+        t1 = np.concatenate([faces[sampled_faces,1:], sampled_points_idx[:,np.newaxis]], axis = -1)
+        # A D C
+        t2 = np.concatenate([faces[sampled_faces,:1], sampled_points_idx[:,np.newaxis], faces[sampled_faces,2:]], axis = -1)
+        
+        faces = np.concatenate([faces, t1, t2])
+        
+        # replace first face
+        faces[sampled_faces,2] = sampled_points_idx
+        
+        if face_tracker is not None:
+            current_tracker = np.arange(len(faces))
+            current_tracker[sampled_faces] = sampled_faces
+            current_tracker[-2*len(sampled_faces):] = np.tile(sampled_faces, 2)
+            face_tracker.update_tracker(current_tracker)
+    else:
+        sampled_points_idx = []
     
-    sampled_points_idx = np.arange(vertices.shape[0], vertices.shape[0] + sampled_points.shape[0])
-    vertices = np.concatenate([vertices, sampled_points])
-    
-    # add the faces
-    # B C D
-    t1 = np.concatenate([faces[sampled_faces,1:], sampled_points_idx[:,np.newaxis]], axis = -1)
-    # A D C
-    t2 = np.concatenate([faces[sampled_faces,:1], sampled_points_idx[:,np.newaxis], faces[sampled_faces,2:]], axis = -1)
-    
-    faces = np.concatenate([faces, t1, t2])
-    
-    # replace first face
-    faces[sampled_faces,2] = sampled_points_idx
-    
-    return vertices, faces
+    return vertices, faces, sampled_points_idx
+        
 
 def find_close_points(vertices, points):
     # checks if any point in points is very close to a vertex
@@ -898,7 +953,7 @@ def collinear(A,B,C, epsilon = 1e-2, return_value = False):
     return out
 
 
-def _add_collinear_point(A,B,C, vertices, faces, sampled_point, sampled_face):
+def _add_collinear_point(A,B,C, vertices, faces, sampled_point, sampled_face, face_tracker = None):
     # adds a point to face [A B C] by splitting edge [A B] a placing the sampled point in the middle
     
     D = vertices.shape[0]
@@ -910,8 +965,9 @@ def _add_collinear_point(A,B,C, vertices, faces, sampled_point, sampled_face):
     
     second_face = np.nonzero((np.sum(np.any(faces[np.newaxis] == np.array([A,B])[...,np.newaxis, np.newaxis], axis = 0), axis = -1) == 2)&np.logical_not(np.any(faces == C, axis = -1)))[0]
     if len(second_face)>0:
+        second_face = second_face[0]
         E = np.setdiff1d(faces[second_face], np.array([A,B]))[0]
-    
+        
         # D B C
         t1 = np.array([[D,B,C]])
         # B D E
@@ -920,21 +976,36 @@ def _add_collinear_point(A,B,C, vertices, faces, sampled_point, sampled_face):
         faces = np.concatenate([faces, t1, t2])
         faces[sampled_face] = [A,D,C]
         faces[second_face] = [A,E,D]
+        
+        if face_tracker is not None:
+            current_tracker = np.arange(len(faces))
+            current_tracker[sampled_face] = sampled_face
+            current_tracker[second_face] = second_face
+            current_tracker[-2] = sampled_face
+            current_tracker[-1] = second_face
+            
+            face_tracker.update_tracker(current_tracker)
     else:
         # D B C
         t1 = np.array([[D,B,C]])
         
         faces = np.concatenate([faces, t1])
         faces[sampled_face] = [A,D,C]
-    
+        
+        if face_tracker is not None:
+            current_tracker = np.arange(len(faces))
+            current_tracker[sampled_face] = sampled_face
+            current_tracker[-1] = sampled_face
+            
+            face_tracker.update_tracker(current_tracker)
+
     return vertices, faces, D
 
-def add_single_point(vertices, faces, sampled_point, sampled_face):
+def add_single_point(vertices, faces, sampled_point, sampled_face, face_tracker = None):
     # adds a single point to the mesh
     # if collinear, it adds it by splitting the corresponding edge
     
     # WARNING: you should check if any point is equal to a vertex!!
-    
     
     A = faces[sampled_face, 0]
     B = faces[sampled_face, 1]
@@ -946,16 +1017,18 @@ def add_single_point(vertices, faces, sampled_point, sampled_face):
         
         # adds the point to the closest edge
         if which_coll==0:
-            return _add_collinear_point(A,B,C,vertices, faces, sampled_point, sampled_face)
+            return _add_collinear_point(A,B,C,vertices, faces, sampled_point, sampled_face, face_tracker=face_tracker)
         elif which_coll == 1:
-            return _add_collinear_point(B,C,A,vertices, faces, sampled_point, sampled_face)
+            return _add_collinear_point(B,C,A,vertices, faces, sampled_point, sampled_face, face_tracker=face_tracker)
         elif which_coll==2:
-            return _add_collinear_point(C,A,B,vertices, faces, sampled_point, sampled_face)
+            return _add_collinear_point(C,A,B,vertices, faces, sampled_point, sampled_face, face_tracker=face_tracker)
     
     # if here, the point is not collinear and can be added safely
-    return add_internal_points(vertices, faces, sampled_point[np.newaxis], sampled_face[np.newaxis])+(vertices.shape[0],)
+    vertices, faces, added_pt = add_internal_points(vertices, faces, sampled_point[np.newaxis], sampled_face[np.newaxis], face_tracker=face_tracker)
+    added_pt = added_pt[0]  # reduce dimensions
+    return vertices, faces, added_pt
 
-def _safe_add_points(vertices, faces, sampled_points, sampled_faces):
+def _safe_add_points(vertices, faces, sampled_points, sampled_faces, face_tracker = None):
     # subroutine of add_points(), to safely add points (duh..)
     
     nfaces = len(faces)
@@ -969,7 +1042,7 @@ def _safe_add_points(vertices, faces, sampled_points, sampled_faces):
     added_points[unique_indices] += np.arange(len(unique_indices))
     
     # add only first occurence of points
-    vertices, faces = add_internal_points(vertices, faces, sampled_points[unique_indices], sampled_faces[unique_indices])
+    vertices, faces, _ = add_internal_points(vertices, faces, sampled_points[unique_indices], sampled_faces[unique_indices], face_tracker=face_tracker)
     
     # select points that need to be projected again
     left_out_points = np.setdiff1d(np.arange(len(sampled_points)), unique_indices)
@@ -984,7 +1057,7 @@ def _safe_add_points(vertices, faces, sampled_points, sampled_faces):
         # sampled_facestrue = closest_faces(sampled_points, vertices, faces, return_faces=True)[1]
         
         
-        vertices, faces, newly_added_pts =  add_points(vertices, faces, sampled_points, sampled_faces)
+        vertices, faces, newly_added_pts = add_points(vertices, faces, sampled_points, sampled_faces, return_face_tracker=False, face_tracker = face_tracker)
         added_points[left_out_points] = newly_added_pts
     
     return vertices, faces, added_points
@@ -1005,9 +1078,12 @@ def compute_collinearity_matrix(vertices, faces, sampled_points, sampled_faces):
     return collinearity_matrix
 
 
-def add_points(vertices, faces, sampled_points, sampled_faces):
+def add_points(vertices, faces, sampled_points, sampled_faces, return_face_tracker = False, face_tracker = None):
     # adds points to the mesh "safely", i.e. by splitting edges and joining to closest vertex if necessary
     nfaces = len(faces)
+    
+    if return_face_tracker and (face_tracker is None):
+        face_tracker = FaceTracker(nfaces)
     
     which_vertex = np.any(find_close_points(vertices, sampled_points), axis = -1)
     
@@ -1019,7 +1095,7 @@ def add_points(vertices, faces, sampled_points, sampled_faces):
     
     
     # add normal_points
-    vertices, faces, newly_added_points = _safe_add_points(vertices, faces, sampled_points[which_not_collinear], sampled_faces[which_not_collinear])
+    vertices, faces, newly_added_points = _safe_add_points(vertices, faces, sampled_points[which_not_collinear], sampled_faces[which_not_collinear], face_tracker = face_tracker)
     
     
     # save position of added points
@@ -1061,17 +1137,19 @@ def add_points(vertices, faces, sampled_points, sampled_faces):
             sampled_face = faces_to_check[sampled_face]
             
             # sampled_facetrue = closest_faces(sampled_points[[i]], vertices, faces, return_faces=True)[1][0]
-            vertices, faces, added_pt = add_single_point(vertices, faces, sampled_points[i], sampled_face)
+            vertices, faces, added_pt = add_single_point(vertices, faces, sampled_points[i], sampled_face, face_tracker=face_tracker)
             added_points[which_collinear[i]] = added_pt
     
-    return vertices, faces, added_points
+    if not return_face_tracker:
+        return vertices, faces, added_points
+    else:
+        return vertices, faces, added_points, face_tracker
 
 
 def closest_faces(points, vertices, faces, return_faces = False):
     # projects the input points on the mesh and returns the corresponding points and faces
     # if return_faces is True, the index of the face on which the point was projected is returned
 
-    # from .point_projection import project_pointcloud_on_faces
     all_proj = project_pointcloud_on_faces(points, vertices, faces)
     picked_faces = np.linalg.norm(points[:,np.newaxis]-all_proj, axis = -1).argmin(axis = -1)
     
