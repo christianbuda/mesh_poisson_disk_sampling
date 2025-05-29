@@ -268,7 +268,7 @@ def compute_close_vertices(vertices, faces, source, dist):
     selected_vertices = np.unique(edges[np.linalg.norm(t_min[:,np.newaxis]*v+P1-P, axis = -1)<dist])
     return selected_vertices
 
-def compute_close_faces(vertices, faces, source, radius, fine_mesh = True, method = 'any'):
+def compute_close_faces(vertices, faces, source, radius, fine_mesh = True, method = 'any', return_original_vertices = False):
     # creates a submesh with all points at a distance 2*radius
     # and selects faces in the ring of distance [radius, 2*radius]
 
@@ -295,13 +295,15 @@ def compute_close_faces(vertices, faces, source, radius, fine_mesh = True, metho
     
     # keep track of source in the euclidean submesh space
     source = np.asarray(selected_vertices == source).nonzero()[0][0]
+    original_vertices = selected_vertices.copy()   # vertices of the full circle submesh in the original mesh space
     
     # compute geodesic distances on the subset
     geoalg = geodesic.PyGeodesicAlgorithmExact(full_circle_vertices, full_circle_faces)
     dists = geoalg.geodesicDistances([source])[0]
 
     if fine_mesh:
-        original_vertices = selected_vertices[dists<2*radius]   # vertices of the full circle submesh in the original mesh space
+        # WRONG?
+        # original_vertices = selected_vertices[dists<2*radius]   # vertices of the full circle submesh in the original mesh space
 
         # create full circle submesh
         selected_vertices = np.asarray(dists<2*radius).nonzero()[0]    # vertices of the full circle submesh in the euclidean submesh space
@@ -317,9 +319,7 @@ def compute_close_faces(vertices, faces, source, radius, fine_mesh = True, metho
         source = np.asarray(selected_vertices == source).nonzero()[0][0]
         
         dists = dists[selected_vertices]   # convert dists vector to full circle mesh space
-    else:
-        original_vertices = selected_vertices.copy()   # vertices of the full circle submesh in the original mesh space
-    
+        original_vertices = original_vertices[selected_vertices]
 
     # vertices of the ring in the full circle submesh space
     selected_vertices = np.asarray(dists>radius).nonzero()[0]
@@ -328,7 +328,10 @@ def compute_close_faces(vertices, faces, source, radius, fine_mesh = True, metho
     # faces of the full circle submesh in the original mesh space
     # original_faces = reducer(np.any(original_vertices == faces[...,np.newaxis], axis = -1), axis = -1).nonzero()[0]
 
-    return full_circle_vertices, full_circle_faces, source, selected_faces, original_faces
+    if not return_original_vertices:
+        return full_circle_vertices, full_circle_faces, source, selected_faces, original_faces
+    else:
+        return full_circle_vertices, full_circle_faces, source, selected_faces, original_faces, original_vertices
 
 class FaceTracker():
     def __init__(self, nfaces):
@@ -1159,3 +1162,384 @@ def closest_faces(points, vertices, faces, return_faces = False):
     if return_faces:
         out = (out, picked_faces)
     return out
+
+
+
+################### vertex sampling #########################
+def vertex_probability(vertices, faces):
+    # face probabilities
+    all_areas = triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]])
+    all_areas /= all_areas.sum()
+    
+    # vertex probability is the probability of all the faces it touches divided by 3
+    all_prob = np.array(np.sum(trimesh.Trimesh(vertices=vertices, faces=faces).faces_sparse.multiply(np.broadcast_to(all_areas[np.newaxis], (len(vertices), len(faces)))), axis = -1))[:,0]
+    all_prob /= all_prob.sum()  # all_prob.sum() is about 3
+    
+    return all_prob
+
+def uniform_vertex_sampling(vertices, faces, num_points, remesh = False, return_indices = True, generator = None):
+    """
+    this uniform vertex sampling is approximate, each vertex is chosen with a probability proportional to the area of the faces it touches
+    
+        vertices: array (n_vertices, 3), vertices array of the mesh
+        faces: array (n_faces, 3), faces array of the mesh
+        num_points: int, number of points to sample
+        remesh: boolean, whether or not to apply a flat remeshing strategy. This will increase the quality of the sampling, but lower the speed of the algorithm
+        generator: (optional) a numpy random generator object to control random sampling
+    """
+    
+    
+    if generator is None:
+        generator = np.random.default_rng()
+        
+    if remesh == True:
+        print('Performing flat remeshing on input mesh...')
+        vertices, faces = flat_remeshing(vertices, faces)
+
+    sampled_vertices = generator.choice(len(vertices), size = num_points, p = vertex_probability(vertices, faces), replace = False)
+
+    if return_indices:
+        return vertices, faces, sampled_vertices
+    else:
+        return vertices[sampled_vertices]
+    
+def sample_mesh_vertices(vertices, faces, npoints, faces_to_sample = None, generator = None, return_indices = True, replace = False):
+    # sample npoints vertices uniformly on the input mesh
+    # NOTE: this is done by sampling vertices based on neighbouring face area
+    # if faces_to_sample is not None, points are only sampled in the subset of vertices adjacent to the specified faces
+    # NOTE: if replace is False and the number of points to sample is greater than the sampling space, npoints is clipped to allow sampling without replacement
+
+
+
+    if generator is None:
+        generator = np.random.default_rng()
+
+    if faces_to_sample is None:
+        vertices_to_sample = np.arange(len(vertices))
+    else:
+        vertices_to_sample = np.unique(faces[faces_to_sample])
+    
+    
+    all_probs = vertex_probability(vertices, faces)
+    all_probs = all_probs[vertices_to_sample]
+    all_probs /= all_probs.sum()
+    
+    if replace is False and  npoints > len(vertices_to_sample):
+        npoints = len(vertices_to_sample)
+    
+    sampled_vertices = generator.choice(vertices_to_sample, size = npoints, p = all_probs, replace = replace)
+
+    if return_indices:
+        return vertices, faces, sampled_vertices
+    else:
+        return vertices[sampled_vertices]
+    
+def edge_distance_poisson_disk_vertex_sampling(vertices, faces, min_dist = None, num_points = None, points_to_sample = None, seed_vertices = None, remesh = False, generator = None, return_original_faces = False, verbose = False):
+    """
+        vertices: array (n_vertices, 3), vertices array of the mesh
+        faces: array (n_faces, 3), faces array of the mesh
+        min_dist: float, minimum distance between the points of the poisson sampling
+        num_points: (optional) int, rough number of points to sample, if min_dist is None, this should be given
+        points_to_sample: points to sample in each disk
+        seed_vertices: (optional) list of int, index of the vertices that should be included in the final sampling
+        remesh: boolean, whether or not to apply a flat remeshing strategy. This will increase the quality of the sampling, but lower the speed of the algorithm
+                NOTE: sometimes it does not work, try upsampling with something more robust
+        generator: (optional) a numpy random generator object to control random sampling
+    """
+    
+    
+    if generator is None:
+        generator = np.random.default_rng()
+        
+    if remesh == True:
+        print('Performing flat remeshing on input mesh...')
+        vertices, faces = flat_remeshing(vertices, faces)
+
+    # get a rough estimate of the number of points needed to cover the mesh
+    total_area = triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).sum()
+    if min_dist is not None:
+        num_points = int(0.5*total_area/min_dist**2)  # rough estimate, the 0.5 is empirical
+        if verbose:
+            print(f'Sampling about {num_points} points with a minimum distance of {min_dist}')
+            
+    elif min_dist is None:
+        assert num_points is not None, 'If min_dist is None, num_points must be not None'
+        min_dist = np.sqrt(0.5*total_area/num_points)
+        
+        if verbose:
+            print(f'Sampling about {num_points} points with an estimated minimum distance of {min_dist}')
+    
+    
+    if points_to_sample is None:
+        # heuristics
+        points_to_sample = int(30*np.max([(triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).max()-np.pi*min_dist**2)/(3*np.pi*min_dist**2), 1]))
+    
+    if verbose:
+        print(f'Number of points sampled in each disk: {points_to_sample}')
+    
+    
+    # variable that determines whether the mesh is fine enough for an accurate sampling
+    fine_mesh = edge_lengths(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).mean()/min_dist
+    if verbose:
+        print(f'Mesh is{'' if fine_mesh<1 else ' not'} fine enough, with a coefficient of {fine_mesh}')
+    # mesh is fine if fine_mesh<<1 (i.e. if a sphere of radius min_dist around a typical vertex contains many faces)
+    fine_mesh = fine_mesh<1
+    
+    Q = deque()
+
+    if seed_vertices is None:
+        # sample first point
+        
+        vertices, faces, sampled_dipoles = sample_mesh_vertices(vertices, faces, npoints = 1, faces_to_sample = None, generator = generator, return_indices = True, replace = False)
+        sampled_dipoles = sampled_dipoles.tolist()
+        
+        Q.append(sampled_dipoles[0])
+        
+        if verbose:
+            print(f'Starting sampling with vertex: {sampled_dipoles[0]}, with coordinates {vertices[sampled_dipoles[0]]}')
+    else:
+        if not isinstance(seed_vertices, np.ndarray):
+            assert isinstance(seed_vertices, list), 'Seed vertices must be a list of mesh vertices'
+        else:
+            assert len(seed_vertices.shape) == 1 and seed_vertices.dtype == int, 'Seed vertices must be a list of mesh vertices'
+        sampled_dipoles = []
+        for v in seed_vertices:
+            sampled_dipoles.append(v)
+            Q.append(v)
+        
+        if verbose:
+            print(f'Starting sampling with {len(seed_vertices)} seed vertices: {seed_vertices}, with coordinates {vertices[seed_vertices]}')
+
+
+    iter = 0
+    pbar = tqdm(total=num_points, desc="Poisson disk sampling points")
+    while len(Q) > 0:
+        pbar.set_description("Iteration %d" % (iter+1))
+        # print(f'Iter: {iter}, dipole: {len(sampled_dipoles)}/{num_points}')
+        
+        # current point
+        point = Q.popleft()
+        
+        # create circular submesh from which to sample
+        full_circle_vertices, full_circle_faces, source, selected_faces, original_faces, original_vertices = compute_close_faces(vertices, faces, point, min_dist, fine_mesh = fine_mesh, method = 'any', return_original_vertices=True)
+        
+        # sample points
+        full_circle_vertices, full_circle_faces, good_points = sample_mesh_vertices(full_circle_vertices, full_circle_faces, npoints = points_to_sample, faces_to_sample = selected_faces, generator = generator, return_indices = True, replace = False)
+        
+        # check if points are at the correct distance from current center
+        geoalg = distance_graph(full_circle_vertices, full_circle_faces)
+        dists = edge_distances(geoalg, [source], good_points)[0]
+        good_points = good_points[(dists>min_dist)&(dists<2*min_dist)]
+        
+        if len(good_points)>0:
+            # check which points are at the correct distance from each other
+            dist_matrix = compute_graph_dist_matrix(geoalg, good_points)
+            tokeep = [0]
+            for i in range(1,len(good_points)):
+                if dist_matrix[tokeep, i].min()>min_dist:
+                    tokeep.append(i)
+            good_points = good_points[tokeep]
+        
+        # convert good points to main mesh space
+        good_points = original_vertices[good_points]
+        
+        ##### check if points are good wrt to main mesh
+
+        # create submesh with radius 3*min_dist around current point to speed up computations
+        # select a subset of vertices using euclidean distance
+        dists = np.linalg.norm(vertices-vertices[point], axis = -1)
+        selected_vertices = np.asarray(dists<3*min_dist).nonzero()[0]
+        
+        # create euclidean submesh
+        selected_faces = faces[np.any(np.any(selected_vertices == faces[...,np.newaxis], axis = -1), axis = -1)]
+        selected_faces = select_connected_faces(selected_faces, point)
+        submesh_vertices, submesh_faces, selected_vertices = create_submesh(vertices, selected_faces)
+        
+        # find already sampled points in submesh space
+        _, points_indices, _ = np.intersect1d(selected_vertices, sampled_dipoles, assume_unique=True, return_indices=True)    
+        old_points_to_check = np.arange(len(selected_vertices))[points_indices]
+        
+        # find points to test in submesh space (the difference with above is due to the fact that I already know that good_points is inside selected_vertices)
+        points_indices = np.nonzero( selected_vertices == np.array(good_points)[:,np.newaxis] )[1]
+        new_points_to_check = np.arange(len(selected_vertices), dtype = np.int32)[points_indices]
+        
+        # compute geodesic distances on the subset
+        geoalg = distance_graph(submesh_vertices, submesh_faces)
+        tokeep = []
+        for i,p in enumerate(new_points_to_check):
+            dists = edge_distances(geoalg, [p], old_points_to_check)[0]
+            if dists.min()>min_dist:
+                tokeep.append(good_points[i])
+                Q.append(good_points[i])
+        sampled_dipoles += tokeep
+        
+        ###################################
+        
+        # OLD
+        # if len(tokeep)>=points_to_sample-max_rejections:
+        #     raise ValueError('Too few rejections!!!')
+        
+        # update progress bar
+        iter += 1
+        pbar.update(len(tokeep))
+    pbar.close()
+    
+    if return_original_faces:
+        return vertices, faces, sampled_dipoles, original_sampled_faces
+    else:
+        return vertices, faces, sampled_dipoles
+
+
+def poisson_disk_vertex_sampling(vertices, faces, min_dist = None, num_points = None, points_to_sample = None, seed_vertices = None, remesh = False, generator = None, return_indices = True, verbose = False):
+    """
+        vertices: array (n_vertices, 3), vertices array of the mesh
+        faces: array (n_faces, 3), faces array of the mesh
+        min_dist: float, minimum distance between the points of the poisson sampling
+        num_points: (optional) int, rough number of points to sample, if min_dist is None, this should be given
+        points_to_sample: points to sample in each disk
+        seed_vertices: (optional) list of int, index of the vertices that should be included in the final sampling
+        remesh: boolean, whether or not to apply a flat remeshing strategy. This will increase the quality of the sampling, but lower the speed of the algorithm
+                NOTE: sometimes it does not work, try upsampling with something more robust
+        generator: (optional) a numpy random generator object to control random sampling
+    """
+    
+    
+    if generator is None:
+        generator = np.random.default_rng()
+        
+    if remesh == True:
+        print('Performing flat remeshing on input mesh...')
+        vertices, faces = flat_remeshing(vertices, faces)
+
+    # get a rough estimate of the number of points needed to cover the mesh
+    total_area = triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).sum()
+    if min_dist is not None:
+        num_points = int(0.5*total_area/min_dist**2)  # rough estimate, the 0.5 is empirical
+        if verbose:
+            print(f'Sampling about {num_points} points with a minimum distance of {min_dist}')
+            
+    elif min_dist is None:
+        assert num_points is not None, 'If min_dist is None, num_points must be not None'
+        min_dist = np.sqrt(0.5*total_area/num_points)
+        
+        if verbose:
+            print(f'Sampling about {num_points} points with an estimated minimum distance of {min_dist}')
+    
+    if points_to_sample is None:
+        # heuristics
+        points_to_sample = int(30*np.max([(triangle_area(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).max()-np.pi*min_dist**2)/(3*np.pi*min_dist**2), 1]))
+    
+    if verbose:
+        print(f'Number of points sampled in each disk: {points_to_sample}')
+    
+    
+    # variable that determines whether the mesh is fine enough for an accurate sampling
+    fine_mesh = edge_lengths(vertices[faces[:,0]], vertices[faces[:,1]], vertices[faces[:,2]]).mean()/min_dist
+    if verbose:
+        print(f'Mesh is{'' if fine_mesh<1 else ' not'} fine enough, with a coefficient of {fine_mesh}')
+    # mesh is fine if fine_mesh<<1 (i.e. if a sphere of radius min_dist around a typical vertex contains many faces)
+    fine_mesh = fine_mesh<1
+    
+    Q = deque()
+
+    if seed_vertices is None:
+        # sample first point
+        
+        vertices, faces, sampled_dipoles = sample_mesh_vertices(vertices, faces, npoints = 1, faces_to_sample = None, generator = generator, return_indices = True, replace = False)
+        sampled_dipoles = sampled_dipoles.tolist()
+        
+        Q.append(sampled_dipoles[0])
+        
+        if verbose:
+            print(f'Starting sampling with vertex: {sampled_dipoles[0]}, with coordinates {vertices[sampled_dipoles[0]]}')
+    else:
+        if not isinstance(seed_vertices, np.ndarray):
+            assert isinstance(seed_vertices, list), 'Seed vertices must be a list of mesh vertices'
+        else:
+            assert len(seed_vertices.shape) == 1 and seed_vertices.dtype == int, 'Seed vertices must be a list of mesh vertices'
+        sampled_dipoles = []
+        for v in seed_vertices:
+            sampled_dipoles.append(v)
+            Q.append(v)
+        
+        if verbose:
+            print(f'Starting sampling with {len(seed_vertices)} seed vertices: {seed_vertices}, with coordinates {vertices[seed_vertices]}')
+
+
+    iter = 0
+    pbar = tqdm(total=num_points, desc="Poisson disk sampling points")
+    while len(Q) > 0:
+        pbar.set_description("Iteration %d" % (iter+1))
+        # print(f'Iter: {iter}, dipole: {len(sampled_dipoles)}/{num_points}')
+        
+        # current point
+        point = Q.popleft()
+        
+        # create circular submesh from which to sample
+        full_circle_vertices, full_circle_faces, source, selected_faces, original_faces, original_vertices = compute_close_faces(vertices, faces, point, min_dist, fine_mesh = fine_mesh, method = 'any', return_original_vertices=True)
+        
+        # sample points
+        full_circle_vertices, full_circle_faces, good_points = sample_mesh_vertices(full_circle_vertices, full_circle_faces, npoints = points_to_sample, faces_to_sample = selected_faces, generator = generator, return_indices = True, replace = False)
+        
+        # check if points are at the correct distance from current center
+        geoalg = geodesic.PyGeodesicAlgorithmExact(full_circle_vertices, full_circle_faces)
+        dists = geoalg.geodesicDistances([source], good_points)[0]
+        good_points = good_points[(dists>min_dist)&(dists<2*min_dist)]
+
+        if len(good_points)>0:
+            # check which points are at the correct distance from each other
+            dist_matrix = compute_dist_matrix(geoalg, good_points)
+            tokeep = [0]
+            for i in range(1,len(good_points)):
+                if dist_matrix[tokeep, i].min()>min_dist:
+                    tokeep.append(i)
+            good_points = good_points[tokeep]
+        
+        # convert good points to main mesh space
+        good_points = original_vertices[good_points]
+        
+        ##### check if points are good wrt to main mesh
+
+        # create submesh with radius 3*min_dist around current point to speed up computations
+        # select a subset of vertices using euclidean distance
+        dists = np.linalg.norm(vertices-vertices[point], axis = -1)
+        selected_vertices = np.asarray(dists<3*min_dist).nonzero()[0]
+        
+        # create euclidean submesh
+        selected_faces = faces[np.any(np.any(selected_vertices == faces[...,np.newaxis], axis = -1), axis = -1)]
+        selected_faces = select_connected_faces(selected_faces, point)
+        submesh_vertices, submesh_faces, selected_vertices = create_submesh(vertices, selected_faces)
+        
+        # find already sampled points in submesh space
+        _, points_indices, _ = np.intersect1d(selected_vertices, sampled_dipoles, assume_unique=True, return_indices=True)    
+        old_points_to_check = np.arange(len(selected_vertices))[points_indices]
+        
+        # find points to test in submesh space (the difference with above is due to the fact that I already know that good_points is inside selected_vertices)
+        points_indices = np.nonzero( selected_vertices == np.array(good_points)[:,np.newaxis] )[1]
+        new_points_to_check = np.arange(len(selected_vertices), dtype = np.int32)[points_indices]
+        
+        # compute geodesic distances on the subset
+        geoalg = geodesic.PyGeodesicAlgorithmExact(submesh_vertices, submesh_faces)
+        tokeep = []
+        for i,p in enumerate(new_points_to_check):
+            dists = geoalg.geodesicDistances([p], old_points_to_check)[0]
+            if dists.min()>min_dist:
+                tokeep.append(good_points[i])
+                Q.append(good_points[i])
+        sampled_dipoles += tokeep
+        
+        ###################################
+        
+        # OLD
+        # if len(tokeep)>=points_to_sample-max_rejections:
+        #     raise ValueError('Too few rejections!!!')
+        
+        # update progress bar
+        iter += 1
+        pbar.update(len(tokeep))
+    pbar.close()
+    
+    if return_indices:
+        return vertices, faces, sampled_dipoles
+    else:
+        return vertices[sampled_dipoles]
