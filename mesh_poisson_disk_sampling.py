@@ -223,7 +223,7 @@ def create_submesh(vertices, faces):
     
     return vertices[interesting_vertices], newfaces, interesting_vertices
 
-def compute_dist_matrix(geoalg, vertices):
+def compute_dist_matrix(geoalg, vertices, verbose = False):
     # compute distance matrix between list of vertices
     # given PyGeodesicAlgorithmExact object in input
     
@@ -231,7 +231,12 @@ def compute_dist_matrix(geoalg, vertices):
     out = np.zeros((nverts, nverts))
     
     # fill upper triangular part of matrix
-    for idx in range(nverts-1):
+    if verbose:
+        iterator = tqdm(range(nverts-1))
+    else:
+        iterator = range(nverts-1)
+        
+    for idx in iterator:
         out[idx, idx+1:] = geoalg.geodesicDistances([vertices[idx]], vertices[idx+1:])[0]
     
     # simmetrize distance matrix
